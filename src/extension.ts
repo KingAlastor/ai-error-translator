@@ -1,7 +1,11 @@
 import * as vscode from "vscode";
 
 let statusBar: vscode.StatusBarItem;
+let debugChannel: vscode.OutputChannel;
+let aiDiagnosticCollection: vscode.DiagnosticCollection;
 const explanationCache = new Map<string, string>();
+const aiDiagnosticsByUri = new Map<string, Map<string, vscode.Diagnostic>>();
+const inFlightRequests = new Set<string>();
 
 type ProviderType = "Ollama (Local)" | "Cloud (OpenAI-Compatible)";
 
@@ -25,6 +29,12 @@ const CLOUD_PRESETS: { label: string; url: string }[] = [
 ];
 
 export function activate(context: vscode.ExtensionContext) {
+  debugChannel = vscode.window.createOutputChannel("AI Error Translator");
+  debugChannel.appendLine("Extension activated");
+  aiDiagnosticCollection = vscode.languages.createDiagnosticCollection(
+    "ai-error-translator",
+  );
+
   statusBar = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Right,
     100,
@@ -57,7 +67,7 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   const hoverProvider = vscode.languages.registerHoverProvider("*", {
-    async provideHover(document, position, token) {
+    provideHover(document, position, token) {
       const diagnostics = vscode.languages.getDiagnostics(document.uri);
       const error = pickBestDiagnosticAt(diagnostics, position);
       if (!error) return null;
@@ -65,65 +75,92 @@ export function activate(context: vscode.ExtensionContext) {
       const cfg = getTranslatorConfig();
       const cacheKey = buildCacheKey(document, error, cfg);
 
+      debugChannel.appendLine(`[hover] key=${cacheKey.substring(0, 80)}`);
+      debugChannel.appendLine(`[hover] cache size=${explanationCache.size}, hit=${explanationCache.has(cacheKey)}`);
+
       if (explanationCache.has(cacheKey)) {
-        return createHover(explanationCache.get(cacheKey)!);
+        upsertAiDiagnostic(document.uri, error, explanationCache.get(cacheKey)!);
+        debugChannel.appendLine(`[hover] returning cached result`);
+        return createHover(explanationCache.get(cacheKey)!, error.range);
       }
 
-      if (cfg.debounceMs > 0) {
-        const debounced = await waitForDebounce(cfg.debounceMs, token);
-        if (!debounced) return null;
-      }
+      // Fire background fetch to populate cache
+      const ac = new AbortController();
+      token.onCancellationRequested(() => ac.abort());
+
+      const prompt = buildPrompt(document, error, cfg.contextLines);
 
       statusBar.text = "$(sync~spin) AI Thinking...";
       statusBar.backgroundColor = new vscode.ThemeColor(
         "statusBarItem.warningBackground",
       );
 
-      const ac = new AbortController();
-      const cancelSub = token.onCancellationRequested(() => ac.abort());
+      debugChannel.appendLine(`[fetch] starting fetch, provider=${cfg.provider}, model=${cfg.localModel}`);
+      inFlightRequests.add(cacheKey);
 
-      const prompt = buildPrompt(document, error, cfg.contextLines);
-      const requestPromise = fetchExplanation(prompt, cfg, context, ac.signal);
-
-      try {
-        const explanation = await raceWithCancellation(requestPromise, token);
-        if (explanation === null) {
-          ac.abort();
+      fetchExplanation(prompt, cfg, context, ac.signal).then(
+        (explanation) => {
+          debugChannel.appendLine(`[fetch] success, cancelled=${token.isCancellationRequested}`);
+          if (token.isCancellationRequested) return;
+          explanationCache.set(cacheKey, explanation);
+          upsertAiDiagnostic(document.uri, error, explanation);
+          debugChannel.appendLine(`[fetch] cached. Cache size now=${explanationCache.size}`);
           resetStatusIdle();
-          return null;
-        }
+        },
+        (err: unknown) => {
+          debugChannel.appendLine(`[fetch] error: ${getErrorMessage(err)}`);
+          if (isAbortError(err) || token.isCancellationRequested) {
+            resetStatusIdle();
+            return;
+          }
+          statusBar.text = "$(error) AI Error";
+          statusBar.backgroundColor = new vscode.ThemeColor(
+            "statusBarItem.errorBackground",
+          );
+          const errorText = `AI Error: ${getErrorMessage(err)}`;
+          explanationCache.set(cacheKey, `**AI Error:** ${escapeMarkdown(getErrorMessage(err))}`);
+          upsertAiDiagnostic(document.uri, error, errorText);
+        },
+      ).finally(() => {
+        inFlightRequests.delete(cacheKey);
+      });
 
-        explanationCache.set(cacheKey, explanation);
-        resetStatusIdle();
-
-        return createHover(explanation);
-      } catch (err: unknown) {
-        if (isAbortError(err) || token.isCancellationRequested) {
-          resetStatusIdle();
-          return null;
-        }
-        statusBar.text = "$(error) AI Error";
-        statusBar.backgroundColor = new vscode.ThemeColor(
-          "statusBarItem.errorBackground",
-        );
-        return hoverForError(err);
-      } finally {
-        cancelSub.dispose();
-      }
+      return null;
     },
   });
+
+  const diagnosticsChangeSub = vscode.languages.onDidChangeDiagnostics((event) => {
+    for (const uri of event.uris) {
+      prefetchExplanationsForUri(uri, context);
+    }
+  });
+
+  const activeEditorSub = vscode.window.onDidChangeActiveTextEditor((editor) => {
+    if (!editor) return;
+    prefetchExplanationsForUri(editor.document.uri, context);
+  });
+
+  const openDocSub = vscode.workspace.onDidOpenTextDocument((document) => {
+    prefetchExplanationsForUri(document.uri, context);
+  });
+
+  const initialEditor = vscode.window.activeTextEditor;
+  if (initialEditor) {
+    prefetchExplanationsForUri(initialEditor.document.uri, context);
+  }
 
   context.subscriptions.push(
     hoverProvider,
     statusBar,
+    debugChannel,
+    aiDiagnosticCollection,
+    diagnosticsChangeSub,
+    activeEditorSub,
+    openDocSub,
     setKeyCommand,
     configureCommand,
     pickLocalModelCommand,
   );
-}
-
-function hoverForError(err: unknown): vscode.Hover {
-  return new vscode.Hover(`**AI Error:** ${escapeMarkdown(getErrorMessage(err))}`);
 }
 
 function resetStatusIdle(): void {
@@ -329,10 +366,98 @@ function documentOffsetAt(pos: vscode.Position): number {
   return pos.line * 1_000_000 + pos.character;
 }
 
-function createHover(text: string): vscode.Hover {
+function createHover(text: string, range?: vscode.Range): vscode.Hover {
   const md = new vscode.MarkdownString(`### AI Explanation\n\n${text}`);
   md.isTrusted = false;
-  return new vscode.Hover(md);
+  return range ? new vscode.Hover(md, range) : new vscode.Hover(md);
+}
+
+function upsertAiDiagnostic(
+  uri: vscode.Uri,
+  original: vscode.Diagnostic,
+  explanation: string,
+): void {
+  const uriKey = uri.toString();
+  const fingerprint = diagnosticFingerprint(original);
+  const existingForUri = aiDiagnosticsByUri.get(uriKey) ?? new Map();
+
+  const explanationText = truncate(explanation.replace(/\s+/g, " ").trim(), 700);
+  const message = `AI explanation:\n${explanationText}`;
+
+  const aiDiagnostic = new vscode.Diagnostic(
+    original.range,
+    message,
+    vscode.DiagnosticSeverity.Information,
+  );
+  aiDiagnostic.source = "AI Error Translator";
+  aiDiagnostic.code = "AI-EXPLAIN";
+
+  existingForUri.set(fingerprint, aiDiagnostic);
+  aiDiagnosticsByUri.set(uriKey, existingForUri);
+  aiDiagnosticCollection.set(uri, Array.from(existingForUri.values()));
+}
+
+function prefetchExplanationsForUri(
+  uri: vscode.Uri,
+  context: vscode.ExtensionContext,
+): void {
+  const document = vscode.workspace.textDocuments.find(
+    (d) => d.uri.toString() === uri.toString(),
+  );
+  if (!document) return;
+
+  const diagnostics = vscode.languages
+    .getDiagnostics(uri)
+    .filter((d) => d.severity === vscode.DiagnosticSeverity.Error)
+    .slice(0, 6);
+  if (diagnostics.length === 0) return;
+
+  const cfg = getTranslatorConfig();
+  for (const diagnostic of diagnostics) {
+    const cacheKey = buildCacheKey(document, diagnostic, cfg);
+    if (explanationCache.has(cacheKey) || inFlightRequests.has(cacheKey)) {
+      continue;
+    }
+
+    const prompt = buildPrompt(document, diagnostic, cfg.contextLines);
+    const ac = new AbortController();
+    inFlightRequests.add(cacheKey);
+    debugChannel.appendLine(`[prefetch] start for ${uri.toString()}`);
+
+    fetchExplanation(prompt, cfg, context, ac.signal)
+      .then((explanation) => {
+        explanationCache.set(cacheKey, explanation);
+        upsertAiDiagnostic(uri, diagnostic, explanation);
+        debugChannel.appendLine(`[prefetch] cached for ${uri.toString()}`);
+      })
+      .catch((err: unknown) => {
+        const errorText = `AI Error: ${getErrorMessage(err)}`;
+        explanationCache.set(
+          cacheKey,
+          `**AI Error:** ${escapeMarkdown(getErrorMessage(err))}`,
+        );
+        upsertAiDiagnostic(uri, diagnostic, errorText);
+        debugChannel.appendLine(`[prefetch] error for ${uri.toString()}: ${getErrorMessage(err)}`);
+      })
+      .finally(() => {
+        inFlightRequests.delete(cacheKey);
+      });
+  }
+}
+
+function diagnosticFingerprint(diagnostic: vscode.Diagnostic): string {
+  const rangeKey = `${diagnostic.range.start.line}:${diagnostic.range.start.character}-${diagnostic.range.end.line}:${diagnostic.range.end.character}`;
+  const code =
+    typeof diagnostic.code === "string" || typeof diagnostic.code === "number"
+      ? String(diagnostic.code)
+      : (diagnostic.code?.value ?? "").toString();
+  return [
+    rangeKey,
+    diagnostic.source ?? "",
+    code,
+    String(diagnostic.severity),
+    diagnostic.message,
+  ].join("|");
 }
 
 function getTranslatorConfig(): TranslatorConfig {
@@ -394,7 +519,6 @@ function buildCacheKey(
     model,
     endpoint,
     document.uri.toString(),
-    String(document.version),
     error.source ?? "",
     code,
     String(error.severity),
@@ -409,56 +533,6 @@ function isLocalProvider(provider: ProviderType): boolean {
 
 function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, "");
-}
-
-function waitForDebounce(
-  debounceMs: number,
-  token: vscode.CancellationToken,
-): Promise<boolean> {
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      disposable.dispose();
-      resolve(true);
-    }, debounceMs);
-
-    const disposable = token.onCancellationRequested(() => {
-      clearTimeout(timeout);
-      disposable.dispose();
-      resolve(false);
-    });
-  });
-}
-
-async function raceWithCancellation<T>(
-  promise: Promise<T>,
-  token: vscode.CancellationToken,
-): Promise<T | null> {
-  if (token.isCancellationRequested) return null;
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const sub = token.onCancellationRequested(() => {
-      if (!settled) {
-        settled = true;
-        sub.dispose();
-        resolve(null);
-      }
-    });
-    promise
-      .then((v) => {
-        if (!settled) {
-          settled = true;
-          sub.dispose();
-          resolve(v);
-        }
-      })
-      .catch((e) => {
-        if (!settled) {
-          settled = true;
-          sub.dispose();
-          reject(e);
-        }
-      });
-  });
 }
 
 function buildPrompt(
