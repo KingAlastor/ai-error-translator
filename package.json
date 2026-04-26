@@ -1,0 +1,153 @@
+{
+  "name": "ai-error-translator",
+  "displayName": "AI Error Translator",
+  "description": "Translate complex compiler errors into plain English using Local or Cloud AI.",
+  "version": "1.1.0",
+  "publisher": "your-publisher",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/ai-error-translator"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/ai-error-translator/issues"
+  },
+  "keywords": [
+    "ai",
+    "error",
+    "diagnostics",
+    "ollama",
+    "openai",
+    "compiler",
+    "hover"
+  ],
+  "engines": {
+    "vscode": "^1.75.0",
+    "node": ">=22"
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext .ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.75.0",
+    "@typescript-eslint/eslint-plugin": "^8.59.0",
+    "@typescript-eslint/parser": "^8.59.0",
+    "eslint": "^8.57.0",
+    "typescript": "^4.9.5"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "AI"
+  ],
+  "activationEvents": [
+    "onLanguage:c",
+    "onLanguage:cpp",
+    "onLanguage:csharp",
+    "onLanguage:css",
+    "onLanguage:dart",
+    "onLanguage:dockerfile",
+    "onLanguage:fsharp",
+    "onLanguage:go",
+    "onLanguage:haskell",
+    "onLanguage:html",
+    "onLanguage:java",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onLanguage:json",
+    "onLanguage:kotlin",
+    "onLanguage:less",
+    "onLanguage:lua",
+    "onLanguage:markdown",
+    "onLanguage:php",
+    "onLanguage:powershell",
+    "onLanguage:python",
+    "onLanguage:r",
+    "onLanguage:ruby",
+    "onLanguage:rust",
+    "onLanguage:scala",
+    "onLanguage:scss",
+    "onLanguage:shellscript",
+    "onLanguage:sql",
+    "onLanguage:swift",
+    "onLanguage:toml",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:vue",
+    "onLanguage:xml",
+    "onLanguage:yaml"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiTranslator.configure",
+        "title": "AI Translator: Configure"
+      },
+      {
+        "command": "aiTranslator.setApiKey",
+        "title": "AI Translator: Enter Cloud API Key"
+      },
+      {
+        "command": "aiTranslator.pickLocalModel",
+        "title": "AI Translator: Pick Local Model (Ollama)"
+      }
+    ],
+    "configuration": {
+      "title": "AI Error Translator",
+      "properties": {
+        "aiTranslator.provider": {
+          "type": "string",
+          "enum": ["Ollama (Local)", "Cloud (OpenAI-Compatible)"],
+          "default": "Ollama (Local)",
+          "description": "Use a local Ollama instance or any OpenAI-compatible HTTPS API."
+        },
+        "aiTranslator.ollamaBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Base URL for Ollama (no trailing path; /api/generate is appended automatically)."
+        },
+        "aiTranslator.localModel": {
+          "type": "string",
+          "default": "qwen2.5-coder:1.5b",
+          "description": "Ollama model name (e.g. llama3.2:3b)."
+        },
+        "aiTranslator.cloudBaseUrl": {
+          "type": "string",
+          "default": "https://api.openai.com/v1",
+          "description": "Base URL for your cloud provider's OpenAI-compatible API (without /chat/completions)."
+        },
+        "aiTranslator.cloudModel": {
+          "type": "string",
+          "default": "gpt-4o-mini",
+          "description": "Cloud model ID to use with the configured cloud provider."
+        },
+        "aiTranslator.cloudHeaders": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "Optional extra HTTP headers for cloud requests (string values only). Example: `{ \"HTTP-Referer\": \"https://myapp\" }` for providers that require metadata.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "aiTranslator.contextLines": {
+          "type": "number",
+          "default": 4,
+          "minimum": 0,
+          "maximum": 20,
+          "description": "Lines of source code above/below the diagnostic to include in the AI prompt."
+        },
+        "aiTranslator.debounceMs": {
+          "type": "number",
+          "default": 120,
+          "minimum": 0,
+          "description": "Hover debounce in milliseconds before requesting an explanation."
+        }
+      }
+    }
+  }
+}
