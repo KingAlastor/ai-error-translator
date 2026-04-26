@@ -3,14 +3,14 @@
   "displayName": "AI Error Translator",
   "description": "Translate complex compiler errors into plain English using Local or Cloud AI.",
   "version": "1.1.0",
-  "publisher": "your-publisher",
+  "publisher": "AncientTech",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/ai-error-translator"
+    "url": "https://github.com/KingAlastor/ai-error-translator"
   },
   "bugs": {
-    "url": "https://github.com/yourusername/ai-error-translator/issues"
+    "url": "https://github.com/KingAlastor/ai-error-translator/issues"
   },
   "keywords": [
     "ai",
